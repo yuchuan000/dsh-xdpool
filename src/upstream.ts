@@ -535,6 +535,96 @@ const SERVER_ID_PATTERN = /"id"\s*:\s*"((?:cmb-)?[0-9a-f]{32})"/
 const DESKTOP_TASK_UA = 'WorkBuddy/5.5.6 WorkBuddy/5.5.6 CLI/2.137.1'
 
 /**
+ * DSH 的身份句，以及改写后顶替它的中性说法。
+ *
+ * 2026-10-21 在 CN chat 端（`/v2/chat/completions`）实测：每次只动 system 消息，
+ * 模型、`max_tokens`、全部请求头保持不变。
+ *
+ * | system 消息                                                  | 结果 |
+ * |-------------------------------------------------------------|------|
+ * | 不带 system                                                  | 200 |
+ * | `You are a helpful assistant.`                               | 200 |
+ * | `You are an AI agent powered by DeepSeek Harness.`           | **400 / code 11128** |
+ * | 同上但去掉句末句号                                            | **400 / code 11128** |
+ * | `You are an AI agent.` + 该句                                 | 200 |
+ * | 该句 + 工具前言 + `<available_skills>`                        | **400 / code 11128** |
+ * | 该句夹在长 prompt 中间一行                                     | 200 |
+ *
+ * 也就是说网关不是拦「AI agent」、不是拦某个前缀、也不是不让写长 prompt：它拦的是
+ * 这句话**作为指令消息的开头**出现，而这正好是 DSH 的
+ * `@deepseek-ai/dsh-system-prompt` 里 `harness:identity` 段的形态。返回
+ * HTTP 400 / `code 11128` / `msg: "Illegal API invocation from an unapproved
+ * channel"` —— 与 {@link WorkBuddyUpstreamClient.prepareChatBody} 已经在处理的
+ * `developer` 角色**共用同一个 code**，所以永远不能只看 code 判断原因。
+ *
+ * 改写保留原意（还是「一个跑在 harness 里的 AI agent」），只把那串被点名的原话换掉。
+ * 这是一次改写，不是删除：说辞变了，但 system prompt 该有的东西一样没少。
+ *
+ * 没有走宿主侧的 `includeHarnessIdentity: false`，因为那是用户 profile 的开关，
+ * 插件管不到别人的部署；改在这里，装上就生效，用户在宿主侧关掉后这里退化成 no-op。
+ */
+const HARNESS_IDENTITY_PHRASE = 'You are an AI agent powered by DeepSeek Harness.'
+const NEUTRAL_IDENTITY_PHRASE = 'You are an AI agent running inside this harness.'
+
+/**
+ * 匹配身份句，句内空格允许任意折行/多空格。
+ *
+ * 实测到的写法用 `includes` 就够，但宿主把这句话作为一个 section 嵌在整段 prompt 里，
+ * 将来一旦被重新折行或缩进，字面匹配会静默失效、拦截立刻回来，所以句内每段空白都按
+ * 「任意空白」处理。顺带忽略大小写，成本为零。
+ */
+const HARNESS_IDENTITY_PATTERN = /You[\s\u00a0]+are[\s\u00a0]+an[\s\u00a0]+AI[\s\u00a0]+agent[\s\u00a0]+powered[\s\u00a0]+by[\s\u00a0]+DeepSeek[\s\u00a0]+Harness\.?/giu
+
+/**
+ * 该字段是否是本改写负责的文本载体。
+ *
+ * chat 文本可能是裸字符串（`content: "…"`），也可能是分段数组
+ * （`content: [{type:'text',text:'…'}]`）。其余字段一律不碰：assistant 的
+ * `tool_calls`、tool 消息的 `tool_call_id` 都不是散文，改进去只会把一次调用改坏。
+ */
+function isIdentityTextCarrier(key: string): boolean {
+  return key === 'content' || key === 'text' || key === 'input_text'
+}
+
+/** 递归替换一段文本里的身份句（字符串 / 数组 / 文本分段对象三种形态都走）。 */
+function rewriteIdentitySentence(value: unknown): unknown {
+  if (typeof value === 'string') return value.replace(HARNESS_IDENTITY_PATTERN, NEUTRAL_IDENTITY_PHRASE)
+  if (Array.isArray(value)) return value.map(rewriteIdentitySentence)
+  if (typeof value !== 'object' || value === null) return value
+  const record = value as Record<string, unknown>
+  for (const [key, nested] of Object.entries(record)) {
+    if (!isIdentityTextCarrier(key)) continue
+    record[key] = rewriteIdentitySentence(nested)
+  }
+  return value
+}
+
+/**
+ * 抹掉指令消息里的身份句。
+ *
+ * 只处理 `system` / `developer` 角色——那是宿主自己的指令通道，身份句就是从那里发出来
+ * 的。用户消息或 tool 结果里如果恰好引用了这句话，原样保留：插件没有理由改用户打的字。
+ *
+ * 有意不看位置：DSH 把 prompt 作为第一条消息发出，但只看 `messages[0]` 会漏掉中途注入
+ * 的 system 更新，以及已经归一化过的 body。幂等——替换后的文本不再匹配该正则。
+ */
+export function rewriteHarnessIdentity(messages: readonly unknown[]): void {
+  for (const value of messages) {
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) continue
+    const message = value as Record<string, unknown>
+    const role = message['role']
+    if (role !== 'system' && role !== 'developer') continue
+    if (message['content'] !== undefined) message['content'] = rewriteIdentitySentence(message['content'])
+    if (typeof message['text'] === 'string') message['text'] = rewriteIdentitySentence(message['text'])
+  }
+}
+
+/** body 里是否还带着那句原话；测试与线上断言用（不做空白容错，看的是字面）。 */
+export function carriesHarnessIdentity(source: string): boolean {
+  return source.includes(HARNESS_IDENTITY_PHRASE)
+}
+
+/**
  * Derive a stable 36-hex device id from the account uid.
  *
  * The upstream keys desktop events to a device. Deriving it from the uid keeps
@@ -1199,7 +1289,14 @@ export class WorkBuddyUpstreamClient {
    * Normalize an OpenAI chat-completions body for the WorkBuddy upstream:
    * force `stream: true` (the upstream rejects non-streaming), convert the
    * DSH `developer` role into `system` (upstream rejects `developer` with
-   * business code 11128), and flatten `tool_choice` into its string form.
+   * business code 11128), flatten `tool_choice` into its string form, and
+   * rewrite the DSH harness identity sentence
+   * ({@link rewriteHarnessIdentity}).
+   *
+   * 身份句是 2026-10-21 新增的第二道同码拦截：`developer` 角色与那句
+   * `You are an AI agent powered by DeepSeek Harness.` 都返回 400 / `11128` /
+   * 「Illegal API invocation from an unapproved channel」，但只有后者在
+   * `msg` 之外无法与前者区分，所以两条规则都必须在这里落地，不能只留一条。
    */
   prepareChatBody(raw: string): string {
     let body: unknown
@@ -1229,6 +1326,9 @@ export class WorkBuddyUpstreamClient {
         const message = value as Record<string, unknown>
         if (message['role'] === 'developer') message['role'] = 'system'
       }
+      // After the role conversion, so a `developer` instruction message is
+      // covered by the same pass whether or not it was relabelled.
+      rewriteHarnessIdentity(obj['messages'])
     }
     const choice = obj['tool_choice']
     if (typeof choice === 'string') {

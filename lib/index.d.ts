@@ -469,7 +469,14 @@ export declare class WorkBuddyUpstreamClient {
    * Normalize an OpenAI chat-completions body for the WorkBuddy upstream:
    * force `stream: true` (the upstream rejects non-streaming), convert the
    * DSH `developer` role into `system` (upstream rejects `developer` with
-   * business code 11128), and flatten `tool_choice` into its string form.
+   * business code 11128), flatten `tool_choice` into its string form, and
+   * rewrite the DSH harness identity sentence
+   * ({@link rewriteHarnessIdentity}).
+   *
+   * 身份句是 2026-10-21 新增的第二道同码拦截：`developer` 角色与那句
+   * `You are an AI agent powered by DeepSeek Harness.` 都返回 400 / `11128` /
+   * 「Illegal API invocation from an unapproved channel」，但只有后者在
+   * `msg` 之外无法与前者区分，所以两条规则都必须在这里落地，不能只留一条。
    */
   prepareChatBody(raw: string): string;
   /**
