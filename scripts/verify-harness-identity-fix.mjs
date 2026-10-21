@@ -1,11 +1,17 @@
 /**
  * xdpool 修复的真机验证：改写后的 body 走真实 CN 网关。
  *
- * 用一个最小 shim 无关路径——直接取池里第一个可用账号的凭据，构造与 DSH 同形态的
- * 报文，经 `WorkBuddyUpstreamClient.prepareChatBody` 归一化后发出。对照组是同一份
- * 未归一化的报文，应当仍被 11128 拦下。
+ * 用一个最小 shim 无关路径——直接取一个可用账号的凭据，构造与 DSH 同形态的报文，
+ * 经 `WorkBuddyUpstreamClient.prepareChatBody` 归一化后发出。对照组是同一份未
+ * 归一化的报文，应当仍被 11128 拦下。
  *
- * 用法：node scripts/verify-harness-identity-fix.mjs [model]
+ * 用法：
+ *   node scripts/verify-harness-identity-fix.mjs [model]
+ *   WORKBUDDY_AUTH_FILE=<info 文件路径> node scripts/verify-harness-identity-fix.mjs
+ *
+ * 凭据来源与环境变量拼写沿用插件本体（`WORKBUDDY_AUTH_FILE` / 桌面 App 的
+ * `CodeBuddyExtension` 目录），不假定任何插件私有目录：那个布局属于具体安装，
+ * 写死进公开脚本会让别人的机器直接找不到凭据。
  */
 
 import { readFileSync, readdirSync, existsSync } from 'node:fs'
@@ -17,20 +23,50 @@ import { WorkBuddyUpstreamClient } from '../lib/index.js'
 const MODEL = process.argv[2] ?? 'deepseek-v4.1-flash'
 const PHRASE = 'You are an AI agent powered by DeepSeek Harness.'
 
+/** 桌面 App 写凭据的目录，各安装位置按序探测（Windows 有 Local / Roaming 两处）。 */
+function authDirs() {
+  const appData = process.env.APPDATA ?? ''
+  const localAppData = process.env.LOCALAPPDATA ?? join(homedir(), 'AppData', 'Local')
+  return [
+    join(localAppData, 'CodeBuddyExtension', 'Data', 'Public', 'auth'),
+    join(appData, 'CodeBuddyExtension', 'Data', 'Public', 'auth'),
+    '/Applications/WorkBuddy.app/Contents/Resources/auth',
+  ].filter((dir) => dir !== '' && existsSync(dir))
+}
+
+/** 读出第一份未过期的凭据文档，或给出可执行的下一步提示。 */
 function credential() {
-  const vault = join(homedir(), '.dsh', 'workbuddy-vault', 'cn')
-  if (!existsSync(vault)) throw new Error(`no vault at ${vault}`)
+  const explicit = process.env.WORKBUDDY_AUTH_FILE
+  const candidates = []
+  if (explicit !== undefined && explicit !== '') {
+    candidates.push(explicit)
+  } else {
+    for (const dir of authDirs()) {
+      for (const file of readdirSync(dir)) {
+        if (file.endsWith('.info') || file.endsWith('.json')) candidates.push(join(dir, file))
+      }
+    }
+  }
+  if (candidates.length === 0) {
+    throw new Error(
+      'no WorkBuddy credential document found.\n'
+      + 'Set WORKBUDDY_AUTH_FILE to the desktop app\'s auth .info file, e.g.\n'
+      + '  WORKBUDDY_AUTH_FILE="%LOCALAPPDATA%\\CodeBuddyExtension\\Data\\Public\\auth\\workbuddy-desktop.info"',
+    )
+  }
   const nowSec = Math.floor(Date.now() / 1000)
-  for (const file of readdirSync(vault).filter((f) => f.endsWith('.json'))) {
-    const doc = JSON.parse(readFileSync(join(vault, file), 'utf8'))
+  for (const file of candidates) {
+    let doc
+    try { doc = JSON.parse(readFileSync(file, 'utf8')) } catch { continue }
     const token = doc?.auth?.accessToken
-    if (typeof token !== 'string') continue
-    const payload = JSON.parse(Buffer.from(token.split('.')[1], 'base64url').toString('utf8'))
-    if (typeof payload.exp === 'number' && payload.exp <= nowSec) continue
+    if (typeof token !== 'string' || token === '') continue
+    let exp
+    try { exp = JSON.parse(Buffer.from(token.split('.')[1], 'base64url').toString('utf8')).exp } catch { continue }
+    if (typeof exp === 'number' && exp <= nowSec) continue
     return {
       accessToken: token,
       refreshToken: doc?.auth?.refreshToken ?? '',
-      expiresAt: doc?.auth?.expiresAt ?? payload.exp,
+      expiresAt: doc?.auth?.expiresAt ?? exp,
       refreshExpiresAt: doc?.auth?.refreshExpiresAt,
       domain: doc?.auth?.domain ?? 'www.workbuddy.cn',
       uid: doc?.account?.uid ?? '',
@@ -39,7 +75,7 @@ function credential() {
       source: 'dsh',
     }
   }
-  throw new Error('no unexpired credential in the vault')
+  throw new Error(`no unexpired credential in ${candidates.length} candidate document(s)`)
 }
 
 const PROMPT = `${PHRASE}\n\n`
