@@ -204,6 +204,45 @@ agent-default-model:
 
 插件每次启动都会把这件事写进 `~/.dsh/.xdpool/startup.log`，所以忘了改也能在日志里找到确切该改什么。
 
+## 被网关拦截时的一键修复
+
+症状：在 DSH 里选 WorkBuddy 分组的模型发消息，回
+
+```
+请求被拦截，请重新发送
+Illegal API invocation from an unapproved channel
+code 11128
+```
+
+原因：WorkBuddy 网关对 chat 请求有两条渠道校验，都回同一个 `code 11128` —— 一是指令消息的
+role 是 `developer`（本插件早已转成 `system`），二是**指令消息里出现 DSH 自己的身份句**
+`You are an AI agent powered by DeepSeek Harness.`。第二条由 `@deepseek-ai/dsh-system-prompt`
+注入，插件只是原样转发，所以要在插件自己的归一化环节改掉。装上含该修复的版本即可；
+**不想升级、或已经装好不想重装**，用下面这个脚本就地修补已安装的产物：
+
+```sh
+# 先看会改什么（不写文件）
+node scripts/fix-xdpool-channel-check.mjs --dry-run
+
+# 修复（自动定位安装、先备份、改完自检）
+node scripts/fix-xdpool-channel-check.mjs
+
+# 其他常用用法
+node scripts/fix-xdpool-channel-check.mjs --check      # 只检查是否已修好
+node scripts/fix-xdpool-channel-check.mjs --list       # 只列出找到的安装
+node scripts/fix-xdpool-channel-check.mjs --rollback   # 从备份还原
+```
+
+要点：
+
+- **不重装、不改 profile 配置、不联网**；只动插件自己的产物文件，改前备份成
+  `lib/index.js.bak-before-channel-fix`。
+- 自动定位：多 profile、新旧包名（`dsh-xdpool` / `dsh-workbuddy-xdpool`）、
+  `node_modules` 与 `vendor/` 都会找；装在别处用 `--dir <插件包根目录>` 指定。
+- **改完必须重启 DSH** 才生效（桌面版完全退出后重新打开）。
+- 幂等，重复跑不会重复改；升级或重装插件会覆盖产物，届时重跑一次即可。
+- 只改写 `system` / `developer` 指令消息里的那句话，用户消息与工具调用参数一律不碰。
+
 ## 命令行
 
 统一用 `dsh plugin --profile desktop exec dsh-xdpool <子命令>` 调用：
